@@ -1883,7 +1883,11 @@ class Albumentations:
             # Compose transforms
             self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
             self.transform = (
-                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"]))
+                A.Compose(
+                    T,
+                    bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels", "box_indices"]),
+                    keypoint_params=A.KeypointParams(format="xy", remove_invisible=False, label_fields=["kp_box_indices", "kp_indices"]),
+                )
                 if self.contains_spatial
                 else A.Compose(T)
             )
@@ -1939,13 +1943,53 @@ class Albumentations:
                 labels["instances"].convert_bbox("xywh")
                 labels["instances"].normalize(*im.shape[:2][::-1])
                 bboxes = labels["instances"].bboxes
-                # TODO: add supports of segments and keypoints
-                new = self.transform(image=im, bboxes=bboxes, class_labels=cls)  # transformed
+                box_indices = list(range(len(cls)))
+                
+                # TODO: add supports of segments
+                kpts = labels["instances"].keypoints
+                if kpts is not None:
+                    N, K = kpts.shape[:2]
+                    flat_kpts = []
+                    kp_box_indices = []
+                    kp_indices = []
+                    h, w = im.shape[:2]
+                    for i in range(N):
+                        for j in range(K):
+                            x, y = kpts[i, j, :2]
+                            flat_kpts.append([float(x * w), float(y * h)])
+                            kp_box_indices.append(i)
+                            kp_indices.append(j)
+                    new = self.transform(image=im, bboxes=bboxes, class_labels=cls, box_indices=box_indices, 
+                                         keypoints=flat_kpts, kp_box_indices=kp_box_indices, kp_indices=kp_indices)
+                else:
+                    new = self.transform(image=im, bboxes=bboxes, class_labels=cls, box_indices=box_indices)  # transformed
+                
                 if len(new["class_labels"]) > 0:  # skip update if no bbox in new im
                     labels["img"] = new["image"]
                     labels["cls"] = np.array(new["class_labels"]).reshape(-1, 1)
                     bboxes = np.array(new["bboxes"], dtype=np.float32)
-                labels["instances"].update(bboxes=bboxes)
+                    if kpts is not None:
+                        surviving_boxes = new["box_indices"]
+                        surviving_kpts = np.zeros((len(surviving_boxes), K, 2), dtype=np.float32)
+                        box_idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(surviving_boxes)}
+                        new_h, new_w = new["image"].shape[:2]
+                        
+                        for kp, b_idx, k_idx in zip(new["keypoints"], new["kp_box_indices"], new["kp_indices"]):
+                            if b_idx in box_idx_map:
+                                x, y = kp
+                                surviving_kpts[box_idx_map[b_idx], int(k_idx)] = [x / new_w, y / new_h]
+                        
+                        # Keep the third coordinate (visibility) unchanged from original keypoints
+                        surviving_indices = np.array(surviving_boxes, dtype=int)
+                        kpts = kpts[surviving_indices]
+                        kpts[..., :2] = surviving_kpts
+                        
+                        # Set visibility to 0 for keypoints that were dropped by Albumentations
+                        dropped_kpts_mask = (surviving_kpts[..., 0] == 0) & (surviving_kpts[..., 1] == 0)
+                        kpts[..., 2][dropped_kpts_mask] = 0
+                        
+                        labels["instances"].keypoints = kpts
+                    labels["instances"].update(bboxes=bboxes)
         else:
             labels["img"] = self.transform(image=labels["img"])["image"]  # transformed
 
